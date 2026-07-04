@@ -1,0 +1,205 @@
+# Meridian
+
+Offline-first field inspection app for React Native. Field technicians
+complete structured inspections — checklists, notes, photos, signatures —
+with zero connectivity, and when two techs have edited the same record
+offline, the app merges their changes without silently dropping either
+person's work.
+
+This is not a CRUD app with an "offline mode" bolted on. The actual
+engineering problem it's built to answer is: **what happens when two
+offline clients edit the same record, and how do you resolve that without
+a server round-trip at edit time.**
+
+## 1. Problem
+
+The obvious approach — timestamp every record, last-write-wins on sync —
+is wrong for this use case, and it fails in a way that's easy to miss in a
+demo and painful in production: it doesn't fail loudly, it fails *quietly*.
+Two inspectors cover the same site on different shifts. Both go offline.
+Inspector A notes a valve reading. Inspector B, working from a stale local
+copy, edits the site notes on the same record. Whoever syncs second wins —
+and the other inspector's write vanishes with no error, no prompt, nothing
+in the UI to suggest it ever happened. In a compliance/safety-inspection
+context, a silently dropped observation isn't a UX papercut, it's the kind
+of bug that shows up in an incident report.
+
+The bar this app is built to clear: **different fields edited concurrently
+must merge automatically and correctly; the same field edited concurrently
+must be surfaced to a human, never dropped.**
+
+## 2. Architecture decision
+
+**CRDT (Yjs) over Operational Transformation, and over per-field last-write-wins.**
+
+- OT requires a central server to sequence operations and is built for
+  real-time collaborative editing (think Google Docs) — it's the wrong
+  tool for "two devices that may not talk to each other for days."
+- Naive per-field last-write-wins (compare `updatedAt` timestamps) *looks*
+  like it solves the same-field case, but it has the same silent-drop
+  problem one level down: whichever write has the later clock value wins,
+  full stop, and the loser's edit is gone with no record it ever existed.
+  It also assumes clocks are trustworthy, which they aren't across
+  real devices.
+- Yjs gives deterministic, mathematically-sound convergence for free (every
+  device that's seen the same set of updates arrives at the same state,
+  regardless of what order they arrived in) — but on its own it has the
+  *exact same* silent-drop problem as naive LWW for same-key writes: it
+  picks a winner and moves on. The actual work in this app is the layer on
+  top of Yjs (`src/sync/conflictDetector.ts`) that watches for exactly the
+  moment a device's own pending edit gets overwritten by that resolution,
+  and turns it into a flagged, user-facing conflict instead of letting it
+  disappear. See `src/sync/syncClient.ts` for the full explanation of why
+  this has to persist *across* sync rounds, not just within one.
+
+**WatermelonDB over Realm/plain SQLite.**
+
+WatermelonDB is reactive (screens re-render automatically when a query's
+underlying data changes — see `src/db/hooks.ts`) and is JSI-backed, so
+local reads/writes never cross the old async bridge. Realm is a comparable
+choice technically; WatermelonDB was picked for its simpler mental model
+around per-record Model classes and lazy queries, which maps cleanly onto
+"one Yjs doc per inspection, one row per inspection."
+
+**Bare React Native CLI, New Architecture (Fabric/TurboModules) on.**
+No Expo — the sync engine and photo/GPS capture don't need it, and staying
+bare avoids an abstraction layer between this code and the native modules
+it depends on (WatermelonDB's SQLite adapter, background-fetch).
+
+## 3. A real bug this project's test suite caught
+
+While writing the two-offline-clients merge test
+(`__tests__/sync/merge.test.ts`), the first implementation of the conflict
+watcher passed on some runs and failed on others — flaky in a way that
+tracked with Yjs's internally-random client IDs, which was the tell that
+something was order-dependent rather than logically wrong.
+
+The bug: a field was marked "no longer watched for conflicts" as soon as
+one sync round completed, even if that round completed *before* the other
+device had pushed anything. Two offline clients don't push in lockstep —
+if device A syncs first (nothing to conflict with yet, so no conflict is
+reported — correctly, at that moment) and stops watching that field, then
+device B's conflicting edit arrives on a *later* round, A has no way left
+to notice its own edit just got silently overwritten. The fix
+(`src/sync/syncClient.ts`, `src/sync/syncEngine.ts`) is to keep a field
+"pending" until a write from a *different* device has actually been
+observed for it — not just until one round trip has happened. Running the
+suite 15 times back to back after the fix (0 failures) is what convinced
+me it was actually fixed and not just less likely to reproduce.
+
+This is exactly the kind of bug the spec's testing guidance was pointing
+at, and it's the main reason the merge test suite is the highest-value
+artifact in this repo, not a checkbox.
+
+## 4. Trade-offs
+
+- **CRDT storage overhead.** Every inspection carries its full Yjs
+  document state (`crdt_state` column), not just its current field
+  values. For a form with a handful of fields this is negligible; it
+  would need attention (e.g. periodic snapshot + log compaction) at much
+  larger field counts or edit-history depth than this app's use case
+  produces.
+- **No visual form builder.** "Dynamic form renderer" here means the
+  renderer (`src/forms/FormRenderer.tsx`) is fully schema-driven — swap in
+  a different `FormSchema` and no renderer code changes — but there's no
+  drag-and-drop UI to *author* that schema. Building one was out of scope
+  for the time budget; the form template lives in
+  `src/forms/templates/safetyInspectionTemplate.ts` as a plain data file.
+- **Composite field values are single conflict units.** Checklist
+  selections and signatures serialize to one string value each
+  (`ChecklistField.tsx`, `SignatureField.tsx`). A concurrent edit to a
+  checklist is one conflict on the whole checklist, not one per checkbox.
+  Modeling each checkbox as its own CRDT key was possible but added
+  complexity disproportionate to the value for this MVP.
+- **Minimal backend is in-memory, single-process.** `src/mock-backend/fakeSyncServer.ts`
+  stands in for "a real Node/Express or Supabase endpoint that stores the
+  same shape of data" (spec section 6) — `src/sync/backend.ts` is the one
+  file a real deployment would need to change; nothing else in the sync
+  engine talks to it directly.
+- **Photo upload isn't implemented**, only tracked. `src/photos/photoStorage.ts`
+  records captured photos with an `uploaded` flag for the background sync
+  engine to act on; the actual "PUT to an S3 presigned URL" half needs a
+  real backend to presign against, which is out of scope here.
+- **No Detox/Maestro E2E suite.** Given the time budget, effort went into
+  the unit/integration test suite for the merge logic instead (spec
+  section 9 calls this "the highest-value test suite in the whole app" —
+  taken literally here). A `Detox` or `Maestro` flow for "fill form →
+  kill app → relaunch → data persisted" is the natural next addition.
+
+## 5. What's verified vs. not, in this environment
+
+Verified directly, in this pass:
+
+- `npx tsc --noEmit` — clean, zero errors.
+- `npx eslint .` — clean.
+- `npx jest` — 4/4 tests passing, including the merge suite run 15
+  consecutive times with zero flakiness after the fix in §3.
+- `pod install` — all 87 pods (WatermelonDB, Yjs's native random-values
+  polyfill path, react-navigation, background-fetch, geolocation,
+  image-picker, svg) resolve and install cleanly.
+- **A real `xcodebuild` Debug build for `iphonesimulator` succeeds**
+  (`BUILD SUCCEEDED`), and the app was installed and launched on a booted
+  iOS 26 simulator with Metro attached — WatermelonDB initialized, the
+  inspection list screen rendered and was reactive (empty-state message +
+  "New inspection" button), confirmed via screenshot.
+- **A real `./gradlew assembleDebug` Android build also succeeds**
+  (`BUILD SUCCESSFUL`, New Architecture on) — see the note below for what
+  that does and doesn't confirm.
+
+Not verified in this pass (needs a real device/emulator session beyond
+what this environment could drive interactively):
+
+- Full interactive walkthrough of every screen (form fill → photo capture
+  → signature → sync → conflict resolution) via tap automation — no
+  Appium/idb/Maestro available in this sandbox. The merge/conflict logic
+  itself has direct automated test coverage instead, which is stronger
+  evidence for the part of the app that actually matters than manual
+  tapping would be.
+- ~~Android build~~ — **verified**: `./gradlew assembleDebug` completes
+  with `BUILD SUCCESSFUL` (395 actionable tasks, ~11 min cold build). Not
+  run on an actual emulator/device in this pass (no AVD configured in this
+  sandbox), so the APK's install/launch behavior specifically isn't
+  confirmed the way iOS's is above — only that it compiles and packages
+  cleanly with New Architecture on.
+- The spec's performance targets (50 pending records + photos syncing
+  without UI-perceived blocking; behavior under 20% simulated packet
+  loss via Charles Proxy / Network Link Conditioner) — these need a real
+  device and real network-conditioning tools, not a simulator.
+- A recorded demo/GIF of two physical offline devices editing the same
+  record and merging on reconnect (spec's suggested "Metric" artifact) —
+  the equivalent automated proof is the merge test suite in §3; a real
+  two-device video is the natural next step before publishing this.
+
+## 6. Project structure
+
+```
+src/
+  db/            WatermelonDB schema, models, reactive query hooks
+  forms/         Schema-driven form renderer + field components
+  sync/          The CRDT engine: crdtDoc, conflictDetector, syncClient
+                 (pure, tested), syncEngine (WatermelonDB-wired), backend
+  mock-backend/  In-memory stand-in for a real sync server
+  photos/        Deferred-upload photo tracking
+  location/      One-shot GPS capture per inspection
+  screens/       Inspection list, form, conflict resolution
+  navigation/    React Navigation stack
+  polyfills/     Metro/Jest webcrypto shim (see file for why)
+__tests__/
+  sync/merge.test.ts   The highest-value test in the repo — see §3
+```
+
+## 7. Running it
+
+```bash
+npm install
+cd ios && bundle install && bundle exec pod install && cd ..
+npx react-native run-ios      # or run-android
+```
+
+Run the test suite:
+
+```bash
+npx jest
+npx tsc --noEmit
+npx eslint .
+```
