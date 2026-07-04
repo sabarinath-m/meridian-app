@@ -11,6 +11,19 @@ engineering problem it's built to answer is: **what happens when two
 offline clients edit the same record, and how do you resolve that without
 a server round-trip at edit time.**
 
+## Screenshots
+
+Captured live on an Android emulator (API 36, arm64) via `adb`, not mocked:
+
+| | | |
+|---|---|---|
+| ![Inspection list, empty state](docs/screenshots/01-inspection-list-empty.png) | ![GPS permission prompt](docs/screenshots/02-gps-permission.png) | ![Dynamic inspection form](docs/screenshots/03-dynamic-inspection-form.png) |
+| 1. Empty list | 2. Native GPS permission prompt on inspection creation | 3. The schema-driven form renderer — checklist, text, numeric, photo, signature, all from one `FormSchema` |
+
+![List reactively updates after creating an inspection](docs/screenshots/04-list-reactive-update.png)
+
+4. Back on the list screen with zero manual refresh — WatermelonDB's `observe()` pushed the new record straight through `useInspections()` the moment it was written.
+
 ## 1. Problem
 
 The obvious approach — timestamp every record, last-write-wins on sync —
@@ -65,6 +78,18 @@ around per-record Model classes and lazy queries, which maps cleanly onto
 No Expo — the sync engine and photo/GPS capture don't need it, and staying
 bare avoids an abstraction layer between this code and the native modules
 it depends on (WatermelonDB's SQLite adapter, background-fetch).
+
+**No Redux/Recoil/Context for app state — the reactive database *is* the
+state layer.** This is the first of five deliberately different state
+setups across my portfolio apps (the others reach for Redux Toolkit,
+Recoil, or plain Context depending on what each app's state actually
+looks like — see each repo's own README). Here, every screen reads
+directly off WatermelonDB's `observe()` queries (`src/db/hooks.ts`); there
+is no separate client-state cache to keep in sync with the database,
+because for an offline-first app the database's reactivity already gives
+you exactly that. Introducing Redux/Recoil on top would mean maintaining
+two sources of truth for the same data — the wrong trade-off for this
+specific app, even though it's the right one for some of the others.
 
 ## 3. A real bug this project's test suite caught
 
@@ -137,38 +162,39 @@ Verified directly, in this pass:
 - `pod install` — all 87 pods (WatermelonDB, Yjs's native random-values
   polyfill path, react-navigation, background-fetch, geolocation,
   image-picker, svg) resolve and install cleanly.
-- **A real `xcodebuild` Debug build for `iphonesimulator` succeeds**
-  (`BUILD SUCCEEDED`), and the app was installed and launched on a booted
-  iOS 26 simulator with Metro attached — WatermelonDB initialized, the
-  inspection list screen rendered and was reactive (empty-state message +
-  "New inspection" button), confirmed via screenshot.
-- **A real `./gradlew assembleDebug` Android build also succeeds**
-  (`BUILD SUCCESSFUL`, New Architecture on) — see the note below for what
-  that does and doesn't confirm.
+- **`./gradlew assembleDebug` succeeds** (`BUILD SUCCESSFUL`, New
+  Architecture on) and **the APK was installed, launched, and driven on a
+  real Android emulator via `adb`** — not just built. That run caught and
+  fixed a real bug: `react-native-background-fetch`'s job scheduler throws
+  a `SecurityException` without `android.permission.ACCESS_NETWORK_STATE`
+  in the manifest (it was missing; see `AndroidManifest.xml`). The
+  screenshots above (empty list → create → dynamic form renders → list
+  reactively updates) were captured from that live run using `adb shell
+  input tap` and `adb exec-out screencap`, not a simulator/mock.
+- A real `xcodebuild` Debug build for `iphonesimulator` also succeeds
+  (`BUILD SUCCEEDED`) and was installed and launched on a booted iOS 26
+  simulator, confirming the codebase isn't Android-only. Per this
+  project's verification policy, Android is the platform used for the
+  actual interactive walkthrough (its `adb`-based automation made that
+  possible without extra tooling); iOS verification stopped at "boots and
+  renders," which it does.
 
-Not verified in this pass (needs a real device/emulator session beyond
-what this environment could drive interactively):
+Not verified in this pass:
 
-- Full interactive walkthrough of every screen (form fill → photo capture
-  → signature → sync → conflict resolution) via tap automation — no
-  Appium/idb/Maestro available in this sandbox. The merge/conflict logic
-  itself has direct automated test coverage instead, which is stronger
-  evidence for the part of the app that actually matters than manual
-  tapping would be.
-- ~~Android build~~ — **verified**: `./gradlew assembleDebug` completes
-  with `BUILD SUCCESSFUL` (395 actionable tasks, ~11 min cold build). Not
-  run on an actual emulator/device in this pass (no AVD configured in this
-  sandbox), so the APK's install/launch behavior specifically isn't
-  confirmed the way iOS's is above — only that it compiles and packages
-  cleanly with New Architecture on.
+- The rest of the flow beyond what's in the screenshots above — photo
+  capture (needs a real camera, not an emulator's virtual scene),
+  signature drawing, sync-conflict resolution with a second simulated
+  device sharing the same backend instance, submitting/completing an
+  inspection. The merge/conflict logic itself already has direct
+  automated test coverage (§3), which is stronger evidence for the part
+  of the app that actually matters than more manual tapping would add.
 - The spec's performance targets (50 pending records + photos syncing
   without UI-perceived blocking; behavior under 20% simulated packet
   loss via Charles Proxy / Network Link Conditioner) — these need a real
-  device and real network-conditioning tools, not a simulator.
+  device and real network-conditioning tools, not an emulator.
 - A recorded demo/GIF of two physical offline devices editing the same
   record and merging on reconnect (spec's suggested "Metric" artifact) —
-  the equivalent automated proof is the merge test suite in §3; a real
-  two-device video is the natural next step before publishing this.
+  the equivalent automated proof is the merge test suite in §3.
 
 ## 6. Project structure
 
