@@ -11,19 +11,6 @@ engineering problem it's built to answer is: **what happens when two
 offline clients edit the same record, and how do you resolve that without
 a server round-trip at edit time.**
 
-## Screenshots
-
-Captured live on an Android emulator (API 36, arm64) via `adb`, not mocked:
-
-| | | |
-|---|---|---|
-| ![Inspection list, empty state](docs/screenshots/01-inspection-list-empty.png) | ![GPS permission prompt](docs/screenshots/02-gps-permission.png) | ![Dynamic inspection form](docs/screenshots/03-dynamic-inspection-form.png) |
-| 1. Empty list | 2. Native GPS permission prompt on inspection creation | 3. The schema-driven form renderer — checklist, text, numeric, photo, signature, all from one `FormSchema` |
-
-![List reactively updates after creating an inspection](docs/screenshots/04-list-reactive-update.png)
-
-4. Back on the list screen with zero manual refresh — WatermelonDB's `observe()` pushed the new record straight through `useInspections()` the moment it was written.
-
 ## 1. Problem
 
 The obvious approach — timestamp every record, last-write-wins on sync —
